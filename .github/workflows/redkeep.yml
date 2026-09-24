@@ -1,0 +1,429 @@
+# redkeep-workflow: v2
+# Save this file as .github/workflows/redkeep.yml
+# Redkeep — runs on your GitHub runner with GITHUB_TOKEN.
+# The Redkeep GitHub App has no Contents permission and cannot read this repository.
+# Everything Redkeep receives is produced by the steps below, which you can read and change.
+# On a push to the default branch, commit-review sends Redkeep the diff for that push.
+name: Redkeep
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  redkeep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Confirm Redkeep workflow
+        env:
+          REDKEEP_API_URL: https://api.redkeep.ai
+          REDKEEP_STRONGHOLD_ID: stronghold-07494fea-2f0d-4773-a61a-2f74daee154e
+          REDKEEP_CONNECTED_REPOSITORY_ID: connrepo-67f602da-1c84-4c74-bb3d-836cbea094e1
+          REDKEEP_DEFAULT_BRANCH: main
+        run: |
+          echo "Redkeep workflow is installed."
+          echo "Event: ${{ github.event_name }} SHA: ${{ github.sha }}"
+
+  technical-dd:
+    # Technical due diligence. Encrypts a snapshot of this repository on this runner and uploads
+    # it to your Stronghold storage. It only does so when you start this workflow by hand AND
+    # Redkeep is waiting for a capture you asked for; every other run exits without sending code.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REDKEEP_API_URL: https://api.redkeep.ai
+      REDKEEP_STRONGHOLD_ID: stronghold-07494fea-2f0d-4773-a61a-2f74daee154e
+      REDKEEP_CONNECTED_REPOSITORY_ID: connrepo-67f602da-1c84-4c74-bb3d-836cbea094e1
+      REDKEEP_OIDC_AUDIENCE: redkeep-technical-dd
+    steps:
+      - name: Write the Redkeep encryption helper
+        run: |
+          cat > "$RUNNER_TEMP/redkeep-technical-dd.mjs" <<'REDKEEP_EOF'
+          // Wraps a random AES-256 key with the RSA public key from the Redkeep upload ticket,
+          // then AES-256-GCM encrypts the archive. Layout: "RKE1" | version 1 | 3 reserved zero
+          // bytes | uint32be wrapped key length | wrapped key | 12 byte nonce | ciphertext | tag.
+          // Only Redkeep's private key can open the result; nothing leaves here in the clear.
+          import { appendFileSync, createReadStream, createWriteStream, readFileSync } from 'node:fs';
+          import { createCipheriv, publicEncrypt, randomBytes, constants } from 'node:crypto';
+          import { once } from 'node:events';
+
+          const temp = process.env.RUNNER_TEMP;
+          const archivePath = temp + '/redkeep-source.zip';
+          const envelopePath = temp + '/redkeep-source.zip.rke1';
+
+          // Redkeep serialises some responses PascalCase, so accept either casing.
+          function pick(source, name) {
+            if (!source) return undefined;
+            const upper = name.charAt(0).toUpperCase() + name.slice(1);
+            return source[name] === undefined ? source[upper] : source[name];
+          }
+
+          function ticket() {
+            const body = JSON.parse(readFileSync(temp + '/redkeep-ticket.json', 'utf8'));
+            if (pick(body, 'success') !== true) {
+              throw new Error('Redkeep rejected the request: ' + (pick(body, 'errorMessage') || 'unknown error'));
+            }
+            return pick(body, 'result') || {};
+          }
+
+          async function put(stream, chunk) {
+            if (!stream.write(chunk)) await once(stream, 'drain');
+          }
+
+          async function encrypt() {
+            const pending = ticket();
+            const pem = pick(pending, 'publicKeyPem');
+            if (!pem) throw new Error('The upload ticket carried no public key.');
+
+            const aesKey = randomBytes(32);
+            const nonce = randomBytes(12);
+            const wrapped = publicEncrypt(
+              { key: pem, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+              aesKey,
+            );
+
+            const header = Buffer.alloc(12);
+            header.write('RKE1', 0, 'ascii');
+            header[4] = 1;
+            header.writeUInt32BE(wrapped.length, 8);
+
+            const cipher = createCipheriv('aes-256-gcm', aesKey, nonce, { authTagLength: 16 });
+            const out = createWriteStream(envelopePath);
+            await put(out, Buffer.concat([header, wrapped, nonce]));
+            for await (const chunk of createReadStream(archivePath)) {
+              const encrypted = cipher.update(chunk);
+              if (encrypted.length) await put(out, encrypted);
+            }
+            await put(out, cipher.final());
+            await put(out, cipher.getAuthTag());
+            await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+            console.log('Encrypted the archive for Redkeep.');
+          }
+
+          function claimOutputs() {
+            const pending = ticket();
+            const requested = pick(pending, 'requested') === true;
+            const lines = ['requested=' + (requested ? 'true' : 'false')];
+            if (requested) {
+              lines.push('ref=' + (pick(pending, 'ref') || ''));
+              lines.push('run_id=' + (pick(pending, 'runId') || ''));
+            }
+            appendFileSync(process.env.GITHUB_OUTPUT, lines.join('\n') + '\n');
+            console.log(requested
+              ? 'Redkeep is waiting for a Technical DD snapshot of ' + (pick(pending, 'ref') || 'the default branch')
+              : 'Nothing to do: ' + (pick(pending, 'detail') || 'no capture is pending'));
+          }
+
+          const command = process.argv[2];
+          if (command === 'claim-outputs') claimOutputs();
+          else if (command === 'encrypt') await encrypt();
+          else if (command === 'upload-url') process.stdout.write(pick(ticket(), 'uploadUrl') || '');
+          else throw new Error('Unknown command: ' + command);
+          REDKEEP_EOF
+
+      - name: Ask Redkeep whether a capture is pending
+        id: capture
+        run: |
+          set -euo pipefail
+          # Short-lived token signed by GitHub. It proves which repository and which workflow file
+          # this job is, so Redkeep needs no secret stored in this repository.
+          OIDC_TOKEN=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$REDKEEP_OIDC_AUDIENCE" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).value))')
+          echo "::add-mask::$OIDC_TOKEN"
+          printf '%s' "$OIDC_TOKEN" > "$RUNNER_TEMP/redkeep-oidc"
+          curl -sS -X POST "$REDKEEP_API_URL/api/public/technical-dd/source/claim" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"strongholdId\":\"$REDKEEP_STRONGHOLD_ID\",\"connectedRepositoryId\":\"$REDKEEP_CONNECTED_REPOSITORY_ID\"}" \
+            -o "$RUNNER_TEMP/redkeep-ticket.json"
+          node "$RUNNER_TEMP/redkeep-technical-dd.mjs" claim-outputs
+
+      - name: Checkout the requested ref
+        if: steps.capture.outputs.requested == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.capture.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Encrypt and upload the snapshot
+        if: steps.capture.outputs.requested == 'true'
+        env:
+          REDKEEP_RUN_ID: ${{ steps.capture.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse HEAD)
+          # Same shape as a GitHub source archive: tracked files only, no git history, no secrets
+          # beyond what is already committed here.
+          git archive --format=zip --prefix="${GITHUB_REPOSITORY#*/}-${SHA:0:7}/" \
+            -o "$RUNNER_TEMP/redkeep-source.zip" HEAD
+          node "$RUNNER_TEMP/redkeep-technical-dd.mjs" encrypt
+          UPLOAD_URL=$(node "$RUNNER_TEMP/redkeep-technical-dd.mjs" upload-url)
+          echo "::add-mask::$UPLOAD_URL"
+          curl -sSf --upload-file "$RUNNER_TEMP/redkeep-source.zip.rke1" \
+            -H "x-ms-blob-type: BlockBlob" \
+            -H "x-ms-version: 2021-08-06" \
+            -H "Content-Type: application/octet-stream" \
+            "$UPLOAD_URL"
+          OIDC_TOKEN=$(cat "$RUNNER_TEMP/redkeep-oidc")
+          echo "::add-mask::$OIDC_TOKEN"
+          curl -sSf -X POST "$REDKEEP_API_URL/api/public/technical-dd/source/complete" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"strongholdId\":\"$REDKEEP_STRONGHOLD_ID\",\"connectedRepositoryId\":\"$REDKEEP_CONNECTED_REPOSITORY_ID\",\"runId\":\"$REDKEEP_RUN_ID\",\"commitSha\":\"$SHA\"}"
+          echo "Uploaded the encrypted snapshot for commit $SHA."
+
+  commit-review:
+    # Default-branch pushes only. The diff is built here and posted to Redkeep; the org App never reads the repository.
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    env:
+      REDKEEP_API_URL: https://api.redkeep.ai
+      REDKEEP_STRONGHOLD_ID: stronghold-07494fea-2f0d-4773-a61a-2f74daee154e
+      REDKEEP_CONNECTED_REPOSITORY_ID: connrepo-67f602da-1c84-4c74-bb3d-836cbea094e1
+      REDKEEP_OIDC_AUDIENCE: redkeep-commit-review
+      REDKEEP_WORKFLOW_VERSION: v2
+    steps:
+      - name: Write the commit-review helper
+        run: |
+          cat > "$RUNNER_TEMP/redkeep-commit-review.mjs" <<'REDKEEP_EOF'
+          import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+
+          function pick(source, name) {
+            if (!source) return undefined;
+            const upper = name.charAt(0).toUpperCase() + name.slice(1);
+            return source[name] === undefined ? source[upper] : source[name];
+          }
+
+          function git(args) {
+            return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+          }
+
+          function isNullSha(sha) {
+            return !sha || /^0+$/.test(sha);
+          }
+
+          function statusName(code) {
+            if (code === 'A') return 'added';
+            if (code === 'D') return 'removed';
+            if (code === 'R') return 'renamed';
+            if (code === 'C') return 'copied';
+            return 'modified';
+          }
+
+          function parseNameStatus(text) {
+            const files = [];
+            for (const line of text.split('\n')) {
+              if (!line.trim()) continue;
+              const parts = line.split('\t');
+              const code = (parts[0] || '').charAt(0);
+              const filename = parts.length > 2 ? parts[2] : parts[1];
+              if (!filename) continue;
+              files.push({ filename, status: statusName(code) });
+            }
+            return files;
+          }
+
+          function collect(base, head) {
+            if (isNullSha(base) || base === head) {
+              return { isCompare: false, base: '', nameStatus: git(['show', '--format=', '--name-status', '--find-renames', head]) };
+            }
+            return { isCompare: true, base, nameStatus: git(['diff', '--name-status', '--find-renames', base, head]) };
+          }
+
+          function patchFor(base, head, filename, isCompare) {
+            const args = isCompare
+              ? ['diff', '--unified=3', base, head, '--', filename]
+              : ['show', '--format=', '--unified=3', head, '--', filename];
+            try { return git(args); } catch { return ''; }
+          }
+
+          function buildDiff(base, head, limits) {
+            let parsed;
+            try { parsed = collect(base, head); } catch { return null; }
+            const all = parseNameStatus(parsed.nameStatus);
+            const take = all.slice(0, limits.maxFiles);
+            const files = take.map((file) => {
+              let patch = patchFor(parsed.base || head, head, file.filename, parsed.isCompare);
+              if (patch.length > limits.maxPatchChars) patch = patch.slice(0, limits.maxPatchChars) + '\n… [truncated]';
+              return { filename: file.filename, status: file.status, patchPreview: patch };
+            });
+            return {
+              isCompareRange: parsed.isCompare,
+              compareBeforeSha: parsed.isCompare ? parsed.base : null,
+              totalFiles: all.length,
+              filesTruncated: all.length > take.length,
+              files,
+            };
+          }
+
+          function fileText(head, filename, maxChars) {
+            try {
+              const content = git(['show', head + ':' + filename]);
+              if (content.indexOf('\0') >= 0) return null;
+              return content.length > maxChars ? content.slice(0, maxChars) : content;
+            } catch {
+              return null;
+            }
+          }
+
+          function claimOutputs() {
+            const body = JSON.parse(readFileSync(process.env.RUNNER_TEMP + '/redkeep-commit-review.json', 'utf8'));
+            if (pick(body, 'success') !== true) {
+              throw new Error('Redkeep rejected the request: ' + (pick(body, 'errorMessage') || 'unknown error'));
+            }
+            const pending = pick(body, 'result') || {};
+            const requested = pick(pending, 'requested') === true;
+            appendFileSync(process.env.GITHUB_OUTPUT, 'requested=' + (requested ? 'true' : 'false') + '\n');
+            console.log(requested ? 'Redkeep will review this push.' : 'Nothing to review: ' + (pick(pending, 'detail') || 'commit analysis is off'));
+          }
+
+          function buildPayload() {
+            const temp = process.env.RUNNER_TEMP;
+            const claim = JSON.parse(readFileSync(temp + '/redkeep-commit-review.json', 'utf8'));
+            const pending = pick(claim, 'result') || {};
+            const limits = {
+              maxFiles: Number(pick(pending, 'maxFiles')) || 40,
+              maxPatchChars: Number(pick(pending, 'maxPatchChars')) || 8000,
+              maxFileChars: Number(pick(pending, 'maxFileChars')) || 50000,
+            };
+            const before = process.env.REDKEEP_BEFORE || '';
+            const after = process.env.REDKEEP_AFTER || '';
+            const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+            const head = event.head_commit || {};
+            const author = (head.author && (head.author.username || head.author.name))
+              || (event.sender && event.sender.login) || '';
+            const commits = (event.commits || []).map((commit) => ({
+              sha: commit.id || '',
+              message: commit.message || '',
+              authorLogin: (commit.author && (commit.author.username || commit.author.name)) || '',
+              committedAtUtc: commit.timestamp || null,
+            }));
+            const reviewDiff = buildDiff(before, after, limits);
+            if (!reviewDiff) throw new Error('Could not diff ' + before + '..' + after);
+            const docBase = String(pick(pending, 'documentationBaseSha') || '');
+            let documentation = null;
+            if (docBase && docBase !== before && docBase !== after && !isNullSha(docBase)) {
+              documentation = buildDiff(docBase, after, limits);
+            }
+            const changedFiles = [];
+            for (const file of reviewDiff.files) {
+              if (file.status === 'removed') continue;
+              const content = fileText(after, file.filename, limits.maxFileChars);
+              if (content === null) continue;
+              changedFiles.push({ path: file.filename, content });
+            }
+            let pullRequests = [];
+            try {
+              const raw = execFileSync('gh', ['api', 'repos/' + process.env.GITHUB_REPOSITORY + '/commits/' + after + '/pulls'], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+              const parsed = JSON.parse(raw);
+              pullRequests = (Array.isArray(parsed) ? parsed : []).map((pr) => ({
+                number: pr.number || 0,
+                title: pr.title || '',
+                body: pr.body || '',
+                htmlUrl: pr.html_url || '',
+              }));
+            } catch (err) {
+              console.log('No associated pull requests: ' + (err && err.message ? err.message : err));
+            }
+            const repo = process.env.GITHUB_REPOSITORY;
+            const htmlUrl = 'https://github.com/' + repo + '/commit/' + after;
+            const diffPayload = (diff) => ({
+              sha: after,
+              message: head.message || '',
+              htmlUrl,
+              authorLogin: author,
+              committedAtUtc: head.timestamp || null,
+              totalFiles: diff.totalFiles,
+              filesTruncated: diff.filesTruncated,
+              isCompareRange: diff.isCompareRange,
+              compareBeforeSha: diff.compareBeforeSha,
+              commitsInRange: commits.length || 1,
+              files: diff.files,
+            });
+            writeFileSync(temp + '/redkeep-commit-review-submit.json', JSON.stringify({
+              strongholdId: process.env.REDKEEP_STRONGHOLD_ID,
+              connectedRepositoryId: process.env.REDKEEP_CONNECTED_REPOSITORY_ID,
+              workflowVersion: process.env.REDKEEP_WORKFLOW_VERSION,
+              before,
+              after,
+              ref: process.env.REDKEEP_REF,
+              commitMessage: head.message || '',
+              authorLogin: author,
+              htmlUrl,
+              committedAtUtc: head.timestamp || null,
+              commits,
+              review: diffPayload(reviewDiff),
+              documentation: documentation ? diffPayload(documentation) : null,
+              changedFiles,
+              pullRequests,
+            }));
+            console.log('Prepared commit review for ' + after + ' (' + reviewDiff.files.length + ' files).');
+          }
+
+          const command = process.argv[2];
+          if (command === 'claim-outputs') claimOutputs();
+          else if (command === 'build') buildPayload();
+          else throw new Error('Unknown command: ' + command);
+
+          REDKEEP_EOF
+
+      - name: Ask Redkeep whether this push should be reviewed
+        id: review
+        run: |
+          set -euo pipefail
+          OIDC_TOKEN=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$REDKEEP_OIDC_AUDIENCE" \
+            | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).value))')
+          echo "::add-mask::$OIDC_TOKEN"
+          printf '%s' "$OIDC_TOKEN" > "$RUNNER_TEMP/redkeep-oidc"
+          curl -sS -X POST "$REDKEEP_API_URL/api/public/commit-review/claim" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"strongholdId\":\"$REDKEEP_STRONGHOLD_ID\",\"connectedRepositoryId\":\"$REDKEEP_CONNECTED_REPOSITORY_ID\",\"workflowVersion\":\"$REDKEEP_WORKFLOW_VERSION\",\"before\":\"${{ github.event.before }}\",\"after\":\"${{ github.sha }}\",\"ref\":\"${{ github.ref }}\"}" \
+            -o "$RUNNER_TEMP/redkeep-commit-review.json"
+          node "$RUNNER_TEMP/redkeep-commit-review.mjs" claim-outputs
+
+      - name: Checkout the push
+        if: steps.review.outputs.requested == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Send the diff to Redkeep
+        if: steps.review.outputs.requested == 'true'
+        env:
+          REDKEEP_BEFORE: ${{ github.event.before }}
+          REDKEEP_AFTER: ${{ github.sha }}
+          REDKEEP_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          node "$RUNNER_TEMP/redkeep-commit-review.mjs" build
+          OIDC_TOKEN=$(cat "$RUNNER_TEMP/redkeep-oidc")
+          echo "::add-mask::$OIDC_TOKEN"
+          curl -sSf -X POST "$REDKEEP_API_URL/api/public/commit-review/submit" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$RUNNER_TEMP/redkeep-commit-review-submit.json"
+          echo "Sent the commit review for ${{ github.sha }}."
+
